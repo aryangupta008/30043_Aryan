@@ -1,0 +1,250 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+
+const app = express();
+const port = 4000;
+const JWT_SECRET = 'marketing_secret_key_123';
+
+app.use(bodyParser.json());
+app.use(express.static('public'));
+
+// ==================== DATABASE SETUP ====================
+const db = new sqlite3.Database('./marketing.db', (err) => { // Persistent file-based DB
+    if (err) console.error('Error opening database:', err);
+    else console.log('Connected to SQLite database.');
+});
+
+// Initialize Tables
+db.serialize(() => {
+    // Users table
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'Marketer'
+    )`);
+
+    // Campaigns table
+    db.run(`CREATE TABLE IF NOT EXISTS campaigns (
+        campaign_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        goal TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        total_budget DECIMAL(15, 2),
+        status TEXT DEFAULT 'Planning',
+        user_id INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
+    )`);
+
+    // Channels table (Master list)
+    db.run(`CREATE TABLE IF NOT EXISTS channels (
+        channel_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT
+    )`);
+
+    // Campaign-Channel junction table (assigns channels to campaigns with specific budget)
+    db.run(`CREATE TABLE IF NOT EXISTS campaign_channels (
+        campaign_channel_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id INTEGER,
+        channel_id INTEGER,
+        channel_budget DECIMAL(15, 2),
+        estimated_roi DECIMAL(5, 2),
+        FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id),
+        UNIQUE(campaign_id, channel_id)
+    )`);
+
+    // Performance metrics table
+    db.run(`CREATE TABLE IF NOT EXISTS performance (
+        performance_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_channel_id INTEGER,
+        metric_date TEXT NOT NULL,
+        impressions INTEGER DEFAULT 0,
+        clicks INTEGER DEFAULT 0,
+        conversions INTEGER DEFAULT 0,
+        amount_spent DECIMAL(15, 2) DEFAULT 0,
+        FOREIGN KEY (campaign_channel_id) REFERENCES campaign_channels(campaign_channel_id) ON DELETE CASCADE
+    )`);
+
+    // Insert default channels if they don't exist
+    const defaultChannels = [
+        ['Email Marketing', 'Sending promotional emails to a subscriber list.'],
+        ['Social Media - Facebook', 'Paid ads and organic posts on Facebook.'],
+        ['Social Media - Instagram', 'Paid ads and organic posts on Instagram.'],
+        ['Google Ads', 'Pay-per-click advertising on the Google network.'],
+        ['Content Marketing - Blog', 'Creating and publishing articles on a company blog.'],
+        ['Influencer Marketing', 'Partnering with influencers for promotion.']
+    ];
+    const insertChannel = db.prepare("INSERT OR IGNORE INTO channels (name, description) VALUES (?, ?)");
+    defaultChannels.forEach(channel => insertChannel.run(channel));
+    insertChannel.finalize();
+
+    // Create a default admin user (password: admin123)
+    bcrypt.hash('admin123', 10, (err, hash) => {
+        if (err) throw err;
+        db.run("INSERT OR IGNORE INTO users (username, password_hash, role) VALUES (?, ?, ?)", ['admin', hash, 'Admin']);
+    });
+});
+
+// ==================== MIDDLEWARE ====================
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.sendStatus(401);
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+};
+
+// ==================== API ROUTES ====================
+
+// AUTH ROUTES
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    db.get("SELECT * FROM users WHERE username = ?", [username], async (err, user) => {
+        if (err || !user || !(await bcrypt.compare(password, user.password_hash))) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const token = jwt.sign({ userId: user.user_id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+        res.json({ message: 'Login successful', token, user: { userId: user.user_id, username: user.username, role: user.role } });
+    });
+});
+
+// CAMPAIGN CRUD ROUTES
+app.get('/api/campaigns', authenticateToken, (req, res) => {
+    const sql = `SELECT c.*, u.username FROM campaigns c LEFT JOIN users u ON c.user_id = u.user_id ORDER BY c.campaign_id DESC`;
+    db.all(sql, [], (err, rows) => err ? res.status(500).send(err.message) : res.json(rows));
+});
+
+app.post('/api/campaigns', authenticateToken, (req, res) => {
+    const { name, description, goal, start_date, end_date, total_budget, status } = req.body;
+    db.run(`INSERT INTO campaigns (name, description, goal, start_date, end_date, total_budget, status, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [name, description, goal, start_date, end_date, total_budget, status, req.user.userId],
+        function (err) {
+            if (err) return res.status(500).send(err.message);
+            res.status(201).json({ message: 'Campaign created!', campaignId: this.lastID });
+        }
+    );
+});
+
+app.put('/api/campaigns/:id', authenticateToken, (req, res) => {
+    const { name, description, goal, start_date, end_date, total_budget, status } = req.body;
+    const id = req.params.id;
+    db.run(`UPDATE campaigns SET name=?, description=?, goal=?, start_date=?, end_date=?, total_budget=?, status=? WHERE campaign_id=?`,
+        [name, description, goal, start_date, end_date, total_budget, status, id],
+        function (err) {
+            if (err) return res.status(500).send(err.message);
+            res.json({ message: 'Campaign updated', changes: this.changes });
+        }
+    );
+});
+
+app.delete('/api/campaigns/:id', authenticateToken, (req, res) => {
+    const id = req.params.id;
+    // CASCADE delete in campaign_channels and performance is handled by SQLite foreign key constraints if enabled
+    db.run("DELETE FROM campaigns WHERE campaign_id = ?", [id], function (err) {
+        if (err) return res.status(500).send(err.message);
+        res.json({ message: 'Campaign deleted', changes: this.changes });
+    });
+});
+
+// CHANNEL ROUTES (Read-only for frontend dropdowns)
+app.get('/api/channels', authenticateToken, (req, res) => {
+    db.all("SELECT * FROM channels ORDER BY name", [], (err, rows) => err ? res.status(500).send(err.message) : res.json(rows));
+});
+
+// CAMPAIGN-CHANNEL ASSIGNMENT ROUTES
+app.post('/api/campaigns/:id/channels', authenticateToken, (req, res) => {
+    const campaignId = req.params.id;
+    const { channel_id, channel_budget, estimated_roi } = req.body;
+    db.run(`INSERT INTO campaign_channels (campaign_id, channel_id, channel_budget, estimated_roi) VALUES (?, ?, ?, ?)`,
+        [campaignId, channel_id, channel_budget, estimated_roi],
+        function (err) {
+            if (err) return res.status(500).send(err.message);
+            res.status(201).json({ message: 'Channel added to campaign!', assignmentId: this.lastID });
+        }
+    );
+});
+app.get('/api/campaigns/:id/channels', authenticateToken, (req, res) => {
+    const campaignId = req.params.id;
+    const sql = `SELECT cc.*, ch.name as channel_name, ch.description 
+                 FROM campaign_channels cc 
+                 JOIN channels ch ON cc.channel_id = ch.channel_id 
+                 WHERE cc.campaign_id = ?`;
+    db.all(sql, [campaignId], (err, rows) => err ? res.status(500).send(err.message) : res.json(rows));
+});
+
+// PERFORMANCE METRICS ROUTES (The C & R of CRUD for metrics)
+app.post('/api/performance', authenticateToken, (req, res) => {
+    const { campaign_channel_id, metric_date, impressions, clicks, conversions, amount_spent } = req.body;
+    db.run(`INSERT INTO performance (campaign_channel_id, metric_date, impressions, clicks, conversions, amount_spent) VALUES (?, ?, ?, ?, ?, ?)`,
+        [campaign_channel_id, metric_date, impressions, clicks, conversions, amount_spent],
+        function (err) {
+            if (err) return res.status(500).send(err.message);
+            res.status(201).json({ message: 'Performance data logged!', performanceId: this.lastID });
+        }
+    );
+});
+
+app.get('/api/performance', authenticateToken, (req, res) => {
+    // Get performance for a specific campaign_channel assignment and date range
+    const { campaign_channel_id, startDate, endDate } = req.query;
+    let sql = `SELECT p.*, cc.campaign_id, ch.name as channel_name 
+               FROM performance p
+               JOIN campaign_channels cc ON p.campaign_channel_id = cc.campaign_channel_id
+               JOIN channels ch ON cc.channel_id = ch.channel_id WHERE 1=1`;
+    let params = [];
+
+    if (campaign_channel_id) {
+        sql += ` AND p.campaign_channel_id = ?`;
+        params.push(campaign_channel_id);
+    }
+    if (startDate) {
+        sql += ` AND p.metric_date >= ?`;
+        params.push(startDate);
+    }
+    if (endDate) {
+        sql += ` AND p.metric_date <= ?`;
+        params.push(endDate);
+    }
+    sql += ` ORDER BY p.metric_date DESC`;
+
+    db.all(sql, params, (err, rows) => err ? res.status(500).send(err.message) : res.json(rows));
+});
+
+// DASHBOARD/REPORTING ROUTE
+app.get('/api/dashboard', authenticateToken, (req, res) => {
+    // Example: Get total spend and conversions per campaign
+    const sql = `
+        SELECT 
+            c.campaign_id,
+            c.name,
+            c.total_budget,
+            SUM(p.amount_spent) as total_spent,
+            SUM(p.conversions) as total_conversions,
+            (SUM(p.amount_spent) / NULLIF(SUM(p.conversions), 0)) as cost_per_conversion
+        FROM campaigns c
+        LEFT JOIN campaign_channels cc ON c.campaign_id = cc.campaign_id
+        LEFT JOIN performance p ON cc.campaign_channel_id = p.campaign_channel_id
+        GROUP BY c.campaign_id
+    `;
+    db.all(sql, [], (err, rows) => err ? res.status(500).send(err.message) : res.json(rows));
+});
+
+// ==================== SERVE FRONTEND ====================
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(port, () => {
+    console.log(`Marketing Campaign Manager API running on http://localhost:${port}`);
+});
